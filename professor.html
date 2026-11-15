@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>لوحة الدكتور - إدارة الحضور</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="card">
+    <h1>👨‍🏫 لوحة الدكتور</h1>
+
+    <!-- تسجيل الدخول -->
+    <section id="loginBox">
+      <p class="sub">سجّل دخولك لبدء جلسة حضور</p>
+      <input type="email" id="email" placeholder="البريد الإلكتروني" dir="ltr">
+      <input type="password" id="pass" placeholder="كلمة المرور" dir="ltr">
+      <button class="btn" onclick="login()">دخول</button>
+      <div class="msg err" id="loginMsg"></div>
+    </section>
+
+    <!-- إعداد الجلسة -->
+    <section id="setupBox" class="hidden">
+      <p class="sub">حدد بيانات المحاضرة ثم ابدأ الجلسة. موقعك الحالي هيتحفظ كموقع القاعة.</p>
+      <label>المادة</label><input id="subject" value="هندسة البرمجيات">
+      <label>السنة الدراسية</label><input id="year" value="الفرقة الثانية - 2026/2027">
+      <div class="row">
+        <div><label>الجروب</label><select id="group"><option value="A">A</option><option value="B">B</option></select></div>
+        <div><label>رقم المحاضرة</label><input type="number" id="lecture" min="1" value="1"></div>
+        <div><label>النطاق (متر)</label><input type="number" id="radius" min="15" value="40"></div>
+      </div>
+      <button class="btn btn-green" id="startBtn" onclick="startSession()">ابدأ الجلسة</button>
+      <div class="msg" id="setupMsg"></div>
+      <h3 style="margin-top:22px">فك ربط جهاز طالب (لو غيّر موبايله)</h3>
+      <select id="unbindSel"></select>
+      <button class="btn btn-gray" onclick="unbind()">فك الربط</button>
+      <h3 style="margin-top:22px">المحاضرات السابقة</h3>
+      <div class="list" id="pastList"></div>
+      <button class="btn btn-gray" onclick="logout()">تسجيل خروج</button>
+    </section>
+
+    <!-- الجلسة الشغالة -->
+    <section id="liveBox" class="hidden">
+      <p class="sub" id="liveTitle"></p>
+      <div id="qrcode"></div>
+      <div class="timer-box">الكود بيتغير كل 15 ثانية: <span id="timer">15</span></div>
+      <div class="counter" id="counter"></div>
+      <div class="list" id="studentsList"></div>
+      <div class="btns">
+        <button class="btn" onclick="printCurrent()">🖨️ طباعة PDF</button>
+        <button class="btn btn-red" onclick="endSession()">إنهاء الجلسة</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- نسخة الطباعة (PDF) -->
+  <div id="printArea"></div>
+
+  <!-- ملفات الإعدادات والسكريبتات الأساسية -->
+  <script src="firebase-config.js"></script>
+  <script src="common.js"></script>
+  <script>
+    let students = [], session = null, sessionId = null, attendance = {};
+    let timerId = null, unsub = null, lastSlot = -1;
+
+    const show = (id) => ['loginBox', 'setupBox', 'liveBox'].forEach(b => $(b).classList.toggle('hidden', b !== id));
+    const newToken = () => Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+
+    auth.onAuthStateChanged(async (u) => {
+      if (!u) return show('loginBox');
+      students = await loadStudents();
+      await syncClock();
+      $('unbindSel').innerHTML = students.map(x => `<option value="${x.id}">${x.id}. ${x.name}</option>`).join('');
+      show('setupBox');
+      loadPast();
+    });
+
+    // تعريف دالة تسجيل الدخول بشكل واضح وعام
+    window.login = function() {
+      $('loginMsg').innerText = '';
+      const email = $('email').value.trim();
+      const pass = $('pass').value;
+      
+      auth.signInWithEmailAndPassword(email, pass)
+        .catch((error) => {
+          console.error(error);
+          $('loginMsg').innerText = 'البريد أو كلمة المرور غلط';
+        });
+    }
+
+    window.logout = function() { 
+      auth.signOut(); 
+    }
+
+    async function startSession() {
+      const msg = $('setupMsg');
+      msg.className = 'msg warn'; msg.innerText = 'جاري تحديد موقع القاعة...';
+      let pos;
+      try { pos = await getPosition(); }
+      catch (e) { msg.className = 'msg err'; msg.innerText = 'لازم تسمح بالموقع (GPS) عشان نحدد القاعة'; return; }
+
+      if (pos.coords.accuracy > 60 && !confirm(`دقة الموقع ضعيفة (±${Math.round(pos.coords.accuracy)} متر). الأفضل تبدأ الجلسة من الموبايل وانت جوه القاعة. تكمل؟`)) { msg.innerText = ''; return; }
+      const now = new Date(nowMs());
+      const data = {
+        subject: $('subject').value.trim(), year: $('year').value.trim(),
+        group: $('group').value, lecture: +$('lecture').value, radius: +$('radius').value,
+        lat: pos.coords.latitude, lng: pos.coords.longitude,
+        date: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`, day: DAYS[now.getDay()],
+        status: 'open', seed: newToken(),
+        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      };
+      const ref = await db.collection('sessions').add(data);
+      openLive(ref.id, data);
+    }
+
+    function openLive(id, data) {
+      sessionId = id; session = data; attendance = {}; lastSlot = -1;
+      show('liveBox');
+      $('liveTitle').innerText = `${data.subject} - جروب ${data.group} - محاضرة ${data.lecture}`;
+      unsub = db.collection('sessions').doc(id).collection('attendance').onSnapshot(snap => {
+        attendance = {};
+        snap.forEach(d => attendance[d.id] = d.data());
+        renderList();
+      });
+      timerId = setInterval(tick, 500); tick();
+    }
+
+    function tick() {
+      const n = nowMs(), slot = Math.floor(n / SLOT_MS);
+      if (slot !== lastSlot) { lastSlot = slot; drawQR(slot); }
+      $('timer').innerText = Math.ceil(((slot + 1) * SLOT_MS - n) / 1000);
+    }
+
+    function drawQR(slot) {
+      const url = new URL('student.html', location.href);
+      url.search = `?s=${sessionId}&t=${tokenFor(session.seed, slot)}`;
+      $('qrcode').innerHTML = '';
+      new QRCode($('qrcode'), { text: url.href, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.H });
+    }
+
+    // تسجيل/إلغاء يدوي بالضغط على اسم الطالب
+    async function toggleManual(id) {
+      const st = students.find(x => x.id === id);
+      const ref = db.collection('sessions').doc(sessionId).collection('attendance').doc(String(id));
+      if (attendance[id]) { if (confirm(`إلغاء حضور ${st.name}؟`)) await ref.delete(); }
+      else if (confirm(`تسجيل ${st.name} حاضر يدويًا؟`))
+        await ref.set({ studentId: id, name: st.name, group: st.group, time: nowMs(), manual: true });
+    }
+
+    const groupStudents = () => students.filter(s => s.group === session.group);
+
+    function renderList() {
+      const list = groupStudents();
+      const present = list.filter(s => attendance[s.id]).length;
+      $('counter').innerText = `حاضر ${present} من ${list.length}`;
+      $('studentsList').innerHTML = list.map(s => {
+        const a = attendance[s.id];
+        return `<div class="item ${a ? 'in' : ''}" style="cursor:pointer" onclick="toggleManual(${s.id})"><span>${s.id}. ${s.name}</span><span class="t">${a ? '✅ ' + fmtTime(a.scannedAt || a.time) : ''}</span></div>`;
+      }).join('');
+    }
+
+    function printReport(sess, att) {
+      const list = students.filter(s => s.group === sess.group);
+      const present = list.filter(s => att[s.id]).length;
+      const rows = list.map((s, i) => {
+        const a = att[s.id];
+        return `<tr class="${a ? '' : 'absent'}"><td>${i + 1}</td><td>${s.name}</td><td>${s.id}</td><td>${a ? 'حاضر ✅' : 'غائب ❌'}</td><td>${a ? fmtTime(a.scannedAt || a.time) : '-'}</td></tr>`;
+      }).join('');
+      $('printArea').innerHTML = `
+        <h2>كشف حضور - ${sess.subject}</h2>
+        <div class="meta"><span>الجروب: ${sess.group}</span><span>المحاضرة رقم: ${sess.lecture}</span>
+          <span>اليوم: ${sess.day}</span><span>التاريخ: ${sess.date}</span><span>السنة الدراسية: ${sess.year}</span></div>
+        <table><thead><tr><th>م</th><th>الاسم</th><th>الرقم</th><th>الحالة</th><th>وقت التسجيل</th></tr></thead><tbody>${rows}</tbody></table>
+        <div class="total">إجمالي الحاضرين: ${present} | إجمالي الغائبين: ${list.length - present} | العدد الكلي: ${list.length}</div>`;
+      const old = document.title;
+      document.title = `حضور_جروب${sess.group}_محاضرة${sess.lecture}_${sess.date}`;
+      window.print();
+      document.title = old;
+    }
+
+    const printCurrent = () => printReport(session, attendance);
+
+    async function endSession() {
+      if (!confirm('تأكيد إنهاء الجلسة؟ الطلاب مش هيقدروا يسجلوا بعد كده.')) return;
+      clearInterval(timerId); if (unsub) unsub();
+      await db.collection('sessions').doc(sessionId).update({ status: 'closed', endedAt: nowMs() });
+      printReport(session, attendance);
+      show('setupBox'); loadPast();
+    }
+
+    async function unbind() {
+      const id = $('unbindSel').value, st = students.find(x => x.id == id);
+      const b = await db.collection('bindings').doc(id).get();
+      if (!b.exists) return alert('الطالب ده مش مربوط بأي جهاز');
+      if (!confirm(`فك ربط جهاز ${st.name}؟`)) return;
+      await db.collection('devices').doc(b.data().deviceId).delete();
+      await b.ref.delete();
+      alert('تم فك الربط، يقدر يسجل من موبايله الجديد');
+    }
+
+    async function loadPast() {
+      const snap = await db.collection('sessions').orderBy('createdAt', 'desc').limit(30).get();
+      $('pastList').innerHTML = snap.empty ? '<div class="past">مفيش محاضرات لسه</div>' : '';
+      snap.forEach(d => {
+        const s = d.data();
+        const div = document.createElement('div');
+        div.className = 'past';
+        div.innerHTML = `<span>جروب ${s.group} - محاضرة ${s.lecture} - ${s.date}</span><button>PDF</button>`;
+        div.querySelector('button').onclick = async () => {
+          const a = {};
+          (await db.collection('sessions').doc(d.id).collection('attendance').get()).forEach(x => a[x.id] = x.data());
+          printReport(s, a);
+        };
+        $('pastList').appendChild(div);
+      });
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>تسجيل الحضور - الطالب</title>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+    <link rel="stylesheet" href="style.css" />
+    <style>
+      #results button {
+        display: block;
+        width: 100%;
+        text-align: right;
+        background: #0f172a;
+        color: #f8fafc;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 6px;
+        cursor: pointer;
+        font-size: 0.9rem;
+      }
+      #results button:hover {
+        border-color: #38bdf8;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>🎓 تسجيل الحضور</h1>
+      <p class="sub" id="hint">
+        اكتب اسمك واختاره من القايمة، ثم امسح الكود الظاهر عند الدكتور
+      </p>
+
+      <input
+        type="text"
+        id="q"
+        placeholder="اكتب جزء من اسمك"
+        autocomplete="off"
+        oninput="search()"
+      />
+      <div id="results"></div>
+      <div id="who"></div>
+
+      <div id="reader"></div>
+
+      <div class="status-box">
+        <div class="status-row">
+          <span>حالة الـ QR:</span
+          ><strong id="qrStatus" class="warn">في انتظار المسح ⏳</strong>
+        </div>
+        <div class="status-row">
+          <span>حالة الـ GPS:</span
+          ><strong id="gpsStatus" class="warn">بيتحدد بعد مسح الكود ⏳</strong>
+        </div>
+      </div>
+
+      <button
+        class="btn btn-green"
+        id="submitBtn"
+        onclick="submitAttendance()"
+        disabled
+      >
+        تأكيد الحضور الآن
+      </button>
+      <div class="msg" id="alertMessage"></div>
+    </div>
+
+    <script src="firebase-config.js"></script>
+    <script src="common.js"></script>
+    <script>
+      let students = [],
+        useUid = false,
+        me = null;
+      let sessionId = null,
+        token = null,
+        scannedAt = null,
+        pos = null;
+      const setStatus = (id, text, cls) => {
+        const e = $(id);
+        e.innerText = text;
+        e.className = cls;
+      };
+      const say = (t, cls) => {
+        const m = $("alertMessage");
+        m.innerText = t;
+        m.className = "msg " + cls;
+      };
+      const norm = (t) =>
+        t
+          .replace(/[\u064B-\u0652\u0640]/g, "")
+          .replace(/[أإآ]/g, "ا")
+          .replace(/ى/g, "ي")
+          .replace(/ة/g, "ه")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      // ---- اختيار الطالب: بالرقم الجامعي لو موجود في students.json، وإلا بالاسم ----
+      loadStudents().then((list) => {
+        students = list;
+        useUid = list.some((s) => s.uid);
+        if (useUid) {
+          $("q").placeholder = "اكتب رقمك الجامعي";
+          $("q").inputMode = "numeric";
+          $("hint").innerText =
+            "اكتب رقمك الجامعي، ثم امسح الكود الظاهر عند الدكتور";
+        }
+      });
+
+      function pick(s) {
+        me = s;
+        $("q").value = useUid ? $("q").value : s.name;
+        $("results").innerHTML = "";
+        $("who").innerText = `✅ ${s.name} (جروب ${s.group})`;
+        refresh();
+      }
+
+      function search() {
+        const v = norm($("q").value);
+        me = null;
+        $("who").innerText = "";
+        $("results").innerHTML = "";
+        if (v) {
+          if (useUid) {
+            const s = students.find((x) => String(x.uid) === v);
+            if (s) pick(s);
+          } else {
+            students
+              .filter((s) => norm(s.name).includes(v))
+              .slice(0, 6)
+              .forEach((s) => {
+                const b = document.createElement("button");
+                b.innerText = s.name;
+                b.onclick = () => pick(s);
+                $("results").appendChild(b);
+              });
+          }
+        }
+        refresh();
+      }
+
+      // ---- مسح الـ QR (بيشتغل حتى لو النت قطع بعد تحميل الصفحة) ----
+      function parseScan(text) {
+        try {
+          const u = new URL(text);
+          const s = u.searchParams.get("s"),
+            t = u.searchParams.get("t");
+          return s && t ? { s, t } : null;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function gotScan(p) {
+        sessionId = p.s;
+        token = p.t;
+        scannedAt = nowMs(); // وقت المسح هو اللي بيتحسب عليه صلاحية الكود
+        setStatus("qrStatus", "تم قراءة الكود ✅", "ok");
+        capturePos();
+        refresh();
+      }
+
+      function capturePos() {
+        setStatus("gpsStatus", "جاري تحديد الموقع ⏳", "warn");
+        return getPosition()
+          .then((p) => {
+            pos = p;
+            setStatus(
+              "gpsStatus",
+              `تم تحديد موقعك ✅ (±${Math.round(p.coords.accuracy)}م)`,
+              "ok",
+            );
+          })
+          .catch(() => {
+            pos = null;
+            setStatus("gpsStatus", "لازم تسمح بالموقع عشان تسجل ❌", "err");
+          });
+      }
+
+      function refresh() {
+        $("submitBtn").disabled = !(me && sessionId && token);
+      }
+
+      (async function init() {
+        await syncClock();
+        const direct = parseScan(location.href);
+        if (direct) {
+          $("reader").classList.add("hidden");
+          return gotScan(direct);
+        }
+        const scanner = new Html5Qrcode("reader");
+        scanner
+          .start(
+            { facingMode: "environment" },
+            { fps: 10, qrbox: { width: 220, height: 220 } },
+            (text) => {
+              const p = parseScan(text);
+              if (!p)
+                return setStatus(
+                  "qrStatus",
+                  "الكود ده مش كود الحضور ❌",
+                  "err",
+                );
+              gotScan(p);
+              scanner.stop().catch(() => {});
+            },
+            () => {},
+          )
+          .catch(() =>
+            setStatus("qrStatus", "تعذر فتح الكاميرا ❌ (لازم HTTPS)", "err"),
+          );
+      })();
+
+      async function submitAttendance() {
+        if (!me) return say("اختار اسمك الأول", "err");
+        $("submitBtn").disabled = true;
+        say("جاري التحقق...", "warn");
+        try {
+          if (nowMs() - scannedAt > OFFLINE_MS)
+            throw "عدّى أكتر من 10 دقايق على مسح الكود، امسح الكود من جديد";
+          if (!pos) {
+            await capturePos();
+            if (!pos) throw "لازم تسمح بالموقع عشان تسجل";
+          }
+
+          let sDoc;
+          try {
+            sDoc = await db
+              .collection("sessions")
+              .doc(sessionId)
+              .get({ source: "server" });
+          } catch (e) {
+            throw "مفيش اتصال بالنت. اتصل وجرب تاني، مسحك للكود محفوظ لمدة 10 دقايق";
+          }
+          if (!sDoc.exists) throw "الجلسة غير موجودة";
+          const s = sDoc.data();
+          if (s.status !== "open") throw "الجلسة انتهت";
+
+          // الكود لازم يكون صالح وقت المسح (مش وقت الإرسال)
+          const slot = Math.floor(scannedAt / SLOT_MS);
+          if (![-1, 0, 1].some((d) => tokenFor(s.seed, slot + d) === token))
+            throw "الكود كان منتهي وقت المسح. امسح الكود الحالي من عند الدكتور مباشرة";
+
+          if (me.group !== s.group)
+            throw `المحاضرة دي لجروب ${s.group} وانت في جروب ${me.group}`;
+          const dist = distanceM(
+            pos.coords.latitude,
+            pos.coords.longitude,
+            s.lat,
+            s.lng,
+          );
+          if (pos.coords.accuracy > 80)
+            throw `دقة الموقع ضعيفة (±${Math.round(pos.coords.accuracy)}م). افتح الموقع الدقيق وجرب قرب الشباك`;
+          if (dist > s.radius)
+            throw `انت بعيد عن القاعة (${Math.round(dist)} متر)`;
+
+          // ربط الجهاز: موبايل واحد = طالب واحد
+          let dev;
+          try {
+            dev = getDeviceId();
+          } catch (e) {
+            throw "المتصفح مانع حفظ البيانات. اقفل وضع التصفح الخاص (Private) وجرب تاني";
+          }
+          const dRef = db.collection("devices").doc(dev),
+            bRef = db.collection("bindings").doc(String(me.id));
+          const [dDoc, bDoc] = await Promise.all([
+            dRef.get({ source: "server" }),
+            bRef.get({ source: "server" }),
+          ]);
+          if (dDoc.exists && dDoc.data().studentId !== me.id)
+            throw "الموبايل ده متسجل بيه طالب تاني";
+          if (bDoc.exists && bDoc.data().deviceId !== dev)
+            throw "رقمك مربوط بموبايل تاني. لو غيّرت موبايلك كلّم الدكتور عشان يفك الربط";
+          if (!dDoc.exists && !bDoc.exists) {
+            const b = db.batch();
+            b.set(dRef, { studentId: me.id, at: nowMs() });
+            b.set(bRef, { deviceId: dev, at: nowMs() });
+            await b.commit();
+          }
+
+          try {
+            await db
+              .collection("sessions")
+              .doc(sessionId)
+              .collection("attendance")
+              .doc(String(me.id))
+              .set({
+                studentId: me.id,
+                name: me.name,
+                group: me.group,
+                time: nowMs(),
+                scannedAt,
+                distance: Math.round(dist),
+              });
+          } catch (e) {
+            throw "اتسجل حضورك قبل كده في المحاضرة دي";
+          }
+
+          say(`🎉 تم تسجيل حضورك يا ${me.name}`, "ok");
+        } catch (e) {
+          say(typeof e === "string" ? e : "حصل خطأ، حاول تاني", "err");
+          refresh();
+        }
+      }
+    </script>
+  </body>
+</html>
